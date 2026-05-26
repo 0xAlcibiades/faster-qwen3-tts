@@ -5,33 +5,54 @@ OpenAI-compatible TTS API server for faster-qwen3-tts.
 Exposes POST /v1/audio/speech compatible with OpenAI's TTS API, enabling
 integration with OpenWebUI, llama-swap, and other OpenAI-compatible clients.
 
+Supports three generation modes:
+  - voice_clone : reference-audio-based cloning (default, backward-compatible)
+  - custom_voice: predefined speaker IDs with optional instruction
+  - voice_design : instruction-based voice synthesis
+
 Usage:
     pip install "faster-qwen3-tts[demo]"
 
-    # Single default voice:
+    # Voice cloning (default):
     python examples/openai_server.py \\
         --ref-audio voice.wav --ref-text "Reference transcription" \\
         --language English
 
-    # Multiple named voices from a JSON config:
-    python examples/openai_server.py --voices voices.json
-
-    # Custom model and port:
+    # CustomVoice model:
     python examples/openai_server.py \\
-        --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \\
-        --ref-audio voice.wav --ref-text "transcript" \\
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
         --port 8000
 
-Voices config (voices.json):
-    {
-        "alloy": {"ref_audio": "voice.wav", "ref_text": "...", "language": "English"},
-        "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"}
-    }
+    # VoiceDesign model:
+    python examples/openai_server.py \\
+        --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \\
+        --port 8000
 
-API usage:
+API usage — voice_clone (default):
     curl -s http://localhost:8000/v1/audio/speech \\
         -H "Content-Type: application/json" \\
         -d '{"model": "tts-1", "input": "Hello!", "voice": "alloy", "response_format": "wav"}' \\
+        --output speech.wav
+
+API usage — voice_design (instruction-based):
+    curl -s http://localhost:8000/v1/audio/speech \\
+        -H "Content-Type: application/json" \\
+        -d '{
+            "model": "tts-1",
+            "input": "Hello world.",
+            "instructions": "Warm, confident British narrator"
+        }' \\
+        --output speech.wav
+
+API usage — custom_voice (speaker ID):
+    curl -s http://localhost:8000/v1/audio/speech \\
+        -H "Content-Type: application/json" \\
+        -d '{
+            "model": "tts-1",
+            "input": "Hello world.",
+            "voice": "aiden",
+            "response_format": "wav"
+        }' \\
         --output speech.wav
 """
 import argparse
@@ -44,7 +65,7 @@ import queue
 import struct
 import sys
 import threading
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Union
 
 import numpy as np
 import torch
@@ -68,6 +89,7 @@ tts_model = None
 voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
+model_type: Optional[str] = None  # "base", "custom_voice", or "voice_design"
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
 
 # ---------------------------------------------------------------------------
@@ -75,12 +97,24 @@ _model_lock = threading.Lock()  # prevent concurrent GPU inference
 # ---------------------------------------------------------------------------
 
 
+class CustomVoiceObject(BaseModel):
+    """Represents a custom voice object as per OpenAI API spec."""
+    id: str
+    name: Optional[str] = None
+    preview_url: Optional[str] = None
+
+
+_VALID_MODES = frozenset(["voice_clone", "custom_voice", "voice_design"])
+
+
 class SpeechRequest(BaseModel):
     model: str = "tts-1"
     input: str
-    voice: str = "alloy"
+    voice: Union[str, dict, CustomVoiceObject] = "alloy"
     response_format: str = "wav"  # wav | pcm | mp3
     speed: float = 1.0           # accepted but not yet applied
+    # NEW — instruction-based voice control (VoiceDesign mode)
+    instructions: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +177,17 @@ def _to_mp3_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def _get_voice_name(req: SpeechRequest) -> str:
+    """Extract the voice name from a SpeechRequest, handling str/dict/CustomVoiceObject."""
+    if isinstance(req.voice, str):
+        return req.voice
+    elif isinstance(req.voice, dict):
+        return req.voice.get("voice_name", req.voice.get("id", "alloy"))
+    elif isinstance(req.voice, CustomVoiceObject):
+        return req.voice.id
+    return "alloy"
+
+
 def resolve_voice(voice_name: str) -> dict:
     """Return voice config dict or fall back to default, else raise 400."""
     if voice_name in voices:
@@ -163,14 +208,49 @@ def resolve_voice(voice_name: str) -> dict:
     )
 
 
+def _resolve_mode(req: SpeechRequest) -> str:
+    """Resolve the generation mode from an explicit request or infer from shape."""
+    # Infer from request shape
+    if req.instructions and isinstance(req.voice, str):
+        return "voice_design"
+    if isinstance(req.voice, dict):
+        return "custom_voice"
+    if isinstance(req.voice, CustomVoiceObject):
+        return "custom_voice"
+    return "voice_clone"
+
+
+def _validate_mode_compatibility(mode: str) -> None:
+    """Raise 400 if the requested mode is incompatible with the loaded model."""
+    if model_type is None:
+        return  # model not loaded yet — will be caught downstream
+
+    compat = {
+        "voice_clone":    {"base", "custom_voice", "voice_design"},
+        "custom_voice":   {"custom_voice"},
+        "voice_design":   {"voice_design"},
+    }
+
+    allowed_modes = compat.get(mode, set())
+    if model_type not in allowed_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Mode {mode!r} requires a {model_type}-variant model "
+                f"(loaded: {model_type}). Allowed modes for this model: "
+                f"{sorted(allowed_modes)}"
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Streaming helper: run sync generator in a background thread
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, None]:
+async def _stream_chunks(req: SpeechRequest, mode: str) -> AsyncGenerator[bytes, None]:
     """
-    Run generate_voice_clone_streaming in a background thread and yield
+    Run the appropriate generate_*_streaming method in a background thread and yield
     raw PCM bytes for each chunk as they arrive.
     """
     q: queue.Queue = queue.Queue()
@@ -179,15 +259,36 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
     def producer():
         try:
             with _model_lock:
-                for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
-                    text=text,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                    chunk_size=voice_cfg.get("chunk_size", 12),
-                    non_streaming_mode=False,
-                ):
-                    q.put(chunk)
+                if mode == "voice_clone":
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
+                        text=req.input,
+                        language=voice_cfg.get("language", "Auto"),
+                        ref_audio=voice_cfg["ref_audio"],
+                        ref_text=voice_cfg.get("ref_text", ""),
+                        chunk_size=12,
+                        non_streaming_mode=False,
+                    ):
+                        q.put(chunk)
+                elif mode == "custom_voice":
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    for chunk, _sr, _timing in tts_model.generate_custom_voice_streaming(
+                        text=req.input,
+                        speaker=voice_cfg.get("speaker", "alloy"),
+                        language=voice_cfg.get("language", "Auto"),
+                        instruct=req.instructions,
+                        chunk_size=12,
+                    ):
+                        q.put(chunk)
+                else:  # voice_design
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    for chunk, _sr, _timing in tts_model.generate_voice_design_streaming(
+                        text=req.input,
+                        instruct=req.instructions or "",
+                        language=voice_cfg.get("language", "Auto"),
+                        chunk_size=12,
+                    ):
+                        q.put(chunk)
         except Exception as exc:
             q.put(exc)
         finally:
@@ -223,7 +324,9 @@ async def create_speech(req: SpeechRequest):
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="'input' text is empty")
 
-    voice_cfg = resolve_voice(req.voice)
+    mode = _resolve_mode(req)
+    _validate_mode_compatibility(mode)
+
     fmt = req.response_format.lower()
 
     _CONTENT_TYPES = {
@@ -244,12 +347,29 @@ async def create_speech(req: SpeechRequest):
 
         def _generate():
             with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
+                if mode == "voice_clone":
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    return tts_model.generate_voice_clone(
+                        text=req.input,
+                        language=voice_cfg.get("language", "Auto"),
+                        ref_audio=voice_cfg["ref_audio"],
+                        ref_text=voice_cfg.get("ref_text", ""),
+                    )
+                elif mode == "custom_voice":
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    return tts_model.generate_custom_voice(
+                        text=req.input,
+                        speaker=voice_cfg.get("speaker", "alloy"),
+                        language=voice_cfg.get("language", "Auto"),
+                        instruct=req.instructions,
+                    )
+                else:
+                    voice_cfg = resolve_voice(_get_voice_name(req))
+                    return tts_model.generate_voice_design(
+                        text=req.input,
+                        instruct=req.instructions or "",
+                        language=voice_cfg.get("language", "Auto"),
+                    )
 
         audio_arrays, sr = await loop.run_in_executor(None, _generate)
         audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
@@ -259,7 +379,7 @@ async def create_speech(req: SpeechRequest):
     async def audio_stream():
         if fmt == "wav":
             yield _wav_header(SAMPLE_RATE)  # stream with unknown data length
-        async for raw_chunk in _stream_chunks(voice_cfg, req.input):
+        async for raw_chunk in _stream_chunks(req, mode):
             yield raw_chunk
 
     return StreamingResponse(audio_stream(), media_type=content_type)
@@ -310,7 +430,7 @@ def _parse_args():
 
 
 def main():
-    global tts_model, voices, default_voice, SAMPLE_RATE
+    global tts_model, voices, default_voice, SAMPLE_RATE, model_type
 
     args = _parse_args()
 
@@ -346,7 +466,8 @@ def main():
         dtype=torch.bfloat16,
     )
     SAMPLE_RATE = tts_model.sample_rate
-    logger.info("Model ready. Sample rate: %d Hz", SAMPLE_RATE)
+    model_type = tts_model.model.model.tts_model_type
+    logger.info("Model ready. Sample rate: %d Hz, model type: %s", SAMPLE_RATE, model_type)
     logger.info("Server listening on http://%s:%d", args.host, args.port)
 
     uvicorn.run(app, host=args.host, port=args.port)
